@@ -1,0 +1,48 @@
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Editors and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local environment files
+.env
+.env.*
+.venv/
+venv/
+ENV/
+
+# Runtime outputs
+*.log
+logs/
+dump/
+tmp/
+temp/
+
+# Experiment artifacts
+VLM_EXP/
+VLM_EXP_bundle/
+
+# Large datasets that should be downloaded separately
+data/scene_datasets/
+data/versioned_data/
+data/objectgoal_hm3d_v2/
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+
+# Project-specific review and submission notes
+TODO/
