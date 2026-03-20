@@ -44,5 +44,4 @@ data/objectgoal_hm3d_v2/
 *.bin
 *.safetensors
 
-# Project-specific review and submission notes
-TODO/
+# Project-specific review and submission notes are intentionally tracked
