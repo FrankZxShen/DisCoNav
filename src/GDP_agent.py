@@ -428,7 +428,7 @@ class Coordinator:
                 # print(self.available_targets) #['A', 'B', 'C', 'D']
 
         # 构建R2输出（投票固定值矩阵)
-        ## 这个仅在消融中使用(消融-去掉R3)
+        ## Legacy alternative kept only as commented reference
         # if len(self.available_targets) > 0:
         #     try:
         #         self.Final_Decision = {agent: self.available_targets[score.index(max(score))] for agent, score in Decision_Score.items()}

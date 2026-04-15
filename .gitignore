@@ -27,14 +27,15 @@ dump/
 tmp/
 temp/
 
+# Backup snapshots
+_backup_before_public_release_*/
+
+# Data files
+data/
+
 # Experiment artifacts
 VLM_EXP/
 VLM_EXP_bundle/
-
-# Large datasets that should be downloaded separately
-data/scene_datasets/
-data/versioned_data/
-data/objectgoal_hm3d_v2/
 
 # Model weights and checkpoints
 *.pt
