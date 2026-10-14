@@ -1,48 +1,80 @@
-# Python cache and local tooling
+# Python caches and environments
 __pycache__/
 *.py[cod]
-*.so
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.ipynb_checkpoints/
-
-# Editors and OS files
-.vscode/
-.idea/
-Thumbs.db
-.DS_Store
-
-# Local environment files
-.env
-.env.*
 .venv/
 venv/
-ENV/
+env/
 
-# Runtime outputs
-*.log
-logs/
-dump/
-tmp/
-temp/
+# IDE and operating-system files
+.DS_Store
+.idea/
+.vscode/
 
-# Backup snapshots
-_backup_before_public_release_*/
+# Datasets, evaluation outputs, and logs
+/data/
+/VLM_EXP/
+/runs/
+/outputs/
+/results/
+/logs/
+/dump/
+/episodes/
+/checkpoints/
+/weights/
 
-# Data files
-data/
+# Local model directories
+/detect/yolov10m/
+/RedNet/model/*
+!/RedNet/model/put_rednet_model_here.txt
 
-# Experiment artifacts
-VLM_EXP/
-VLM_EXP_bundle/
-
-# Model weights and checkpoints
+# Model weights and serialized numerical data
 *.pt
 *.pth
 *.ckpt
-*.onnx
-*.bin
 *.safetensors
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
 
-# Project-specific review and submission notes are intentionally tracked
+# Scene, mesh, media, and archive data
+*.glb
+*.gltf
+*.obj
+*.ply
+*.stl
+*.fbx
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Compiled binaries and build outputs
+*.so
+*.dylib
+*.dll
+*.exe
+*.a
+*.o
+build/
+dist/
+cmake-build-*/
+

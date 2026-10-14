@@ -117,6 +117,8 @@ class LLM_Agent(Agent):
         self.collision_s = 0
         self.replan_count = 0
         self.replan_flag = 0
+        self.navigation_goal_reached = False
+        self.navigation_goal_xy = None
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -234,6 +236,8 @@ class LLM_Agent(Agent):
         self.replan_count = 0
         self.replan_flag = 0
         self.stop = 0
+        self.navigation_goal_reached = False
+        self.navigation_goal_xy = None
 
         self.eve_angle = 0
 
@@ -437,7 +441,9 @@ class LLM_Agent(Agent):
         
 
     
-    def act(self, goal_points: list, )-> Dict[str, int]:
+    def act(self, goal_points: list, wait_for_allocation=False)-> Dict[str, int]:
+        self.navigation_goal_reached = False
+        self.navigation_goal_xy = tuple(goal_points)
         # ------------------------------------------------------------------
         ##### Update long-term goal if target object is found
         ##### Otherwise, use the VLM to select the goal
@@ -485,6 +491,7 @@ class LLM_Agent(Agent):
         planner_inputs['map_target'] = self.target_point_map  # global_goals[e]
         planner_inputs['new_goal'] = (self.l_step % self.args.num_local_steps - 1) == 0
         planner_inputs['found_goal'] = found_goal
+        planner_inputs['wait_for_allocation'] = bool(wait_for_allocation)
         if self.args.visualize or self.args.print_images:
             planner_inputs['map_edge'] = self.target_edge_map
             self.local_map[-1, :, :] = 1e-5
@@ -600,8 +607,16 @@ class LLM_Agent(Agent):
                                                     self.collision_map.shape)
                         self.collision_map[r, c] = 1
 
+        if planner_inputs.get('wait_for_allocation', False) and planner_inputs['found_goal'] == 0:
+            # An empty/completed bundle waits by scanning in place.  Stop (0)
+            # would terminate ObjectNav, while a point goal can still move.
+            self.navigation_goal_reached = False
+            return 3
+
         stg, stop = self._get_stg(map_pred, start, np.copy(goal),
                                   planning_window)
+
+        self.navigation_goal_reached = bool(stop and planner_inputs['found_goal'] == 0)
         
         if stop and planner_inputs['found_goal'] == 1:
             action = 0  # Stop

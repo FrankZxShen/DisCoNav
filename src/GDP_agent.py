@@ -8,6 +8,9 @@ import logging
 import random
 from collections import defaultdict
 from itertools import combinations
+from math import isfinite
+
+from src.target_auction import PriorityAuctionSystem
 
 import ast
 import numpy as np
@@ -46,32 +49,45 @@ def calculate_frontier_distance(frontiers_dict, frontier_keys, start):
 
     return distances
 
-def calculate_R3_weighted_scores(decision_scores, frontier_distances, alpha=0.7): # change!!! \alpha = 0.7(first is new)
+def calculate_R3_weighted_scores(decision_scores, frontier_distances, alpha=0.7):
     """
     返回格式: {agent_id: {target: weighted_score}}
     """
+    if not isfinite(alpha) or not 0 <= alpha <= 1:
+        raise ValueError("voting alpha must lie in [0, 1]")
     weighted_results = {}
     
     for agent_id in decision_scores:
         # 获取有效目标（两者都存在的目标）
         targets = [
             chr(65+i) for i in range(len(decision_scores[agent_id])) 
-            if chr(65+i) in frontier_distances[agent_id]
+            if chr(65+i) in frontier_distances.get(agent_id, {})
         ]
+        if not targets:
+            continue
         
         # 提取对应数据
         decisions = np.array([
-            decision_scores[agent_id][i] 
-            for i, t in enumerate(targets)
-        ])
+            decision_scores[agent_id][ord(t) - ord('A')]
+            for t in targets
+        ], dtype=float)
         distances = np.array([
             frontier_distances[agent_id][t] 
             for t in targets
-        ])
+        ], dtype=float)
+        if (not np.all(np.isfinite(decisions)) or np.any(decisions < 0)
+                or not np.all(np.isfinite(distances)) or np.any(distances < 0)):
+            raise ValueError("frontier scores and distances must be finite and nonnegative")
         
         # 计算加权分数
-        norm_decisions = decisions/(decisions.sum()+1e-10)
-        norm_distances = (1/(distances+1e-10))/(1/(distances+1e-10)).sum()
+        norm_decisions = (decisions / decisions.sum() if decisions.sum() > 0
+                          else np.full(len(targets), 1.0 / len(targets)))
+        zero_distance = distances == 0
+        if np.any(zero_distance):
+            norm_distances = zero_distance.astype(float) / zero_distance.sum()
+        else:
+            inverse_distances = distances.min() / distances
+            norm_distances = inverse_distances / inverse_distances.sum()
         weighted_scores = alpha*norm_decisions + (1-alpha)*norm_distances
         
         # 存储结果
@@ -122,126 +138,20 @@ def get_frontier_key_by_letter(full_Frontiers_dict, letter):
     # 返回对应的 frontier key
     return f"frontier_{letter_to_index[letter]}"
 
-# 前面的是ds，后面是ds'，参数是lambda
-def optimal_weighted_combination(seq1, seq2, weights=(0.3, 0.7)): # change!!! \lambda = 0.3(second is original)
+def optimal_weighted_combination(seq1, seq2, weights=(0.3, 0.7)):
+    if len(seq1) != len(seq2):
+        raise ValueError("initial and updated score vectors must have the same length")
+    if (len(weights) != 2 or any(not isfinite(w) or w < 0 for w in weights)
+            or abs(sum(weights) - 1.0) > 1e-10):
+        raise ValueError("decision weights must be nonnegative and sum to one")
     return [
         float(a)*weights[0] + float(b)*weights[1]
         for a, b in zip(seq1, seq2)
     ]
 
-class PriorityAuctionSystem:
-    def __init__(self, agents, targets, r3_inputs):
-        self.agents = agents
-        self.targets = targets
-        self.r3_inputs = r3_inputs
-        
-        # 扩展估值结构：支持组合包估值
-        self.bundle_valuations = {}
-        self._precompute_bundle_values()
-        
-        # 分配结果
-        self.assignments = {}      # {target: agent}
-        self.agent_assignments = {}  # {agent: target}
-        self.payments = defaultdict(float)
-        
-        # 拍卖参数
-        self.RESERVE_PRICE = 0
-
-    def _precompute_bundle_values(self):
-        """预计算所有可能组合包的估值（如文档图1的t1+t2组合）"""
-        for agent_id, agent_vals in sorted(self.r3_inputs.items()):
-            # 单物品估值
-            for target in self.targets:
-                self.bundle_valuations[(agent_id, (target,))] = agent_vals[target]
-            
-            # 组合包估值（如文档7.2节示例）
-            for bundle_size in range(2, len(self.targets)+1):
-                for bundle in combinations(self.targets, bundle_size):
-                    # 实际系统需实现组合估值计算（如路径优化）
-                    bundle_val = sum(agent_vals[t] for t in bundle) * 0.8  # 简化的协同效应
-                    self.bundle_valuations[(agent_id, bundle)] = bundle_val
-
-    def calculate_vcg_payment(self, winner, won_bundle):
-        """实现VCG定价机制（如文档7.3节公式）"""
-        # 1. 计算全局最优社会福利
-        optimal_value = self.solve_winner_determination()
-        
-        # 2. 排除当前获胜者后的最优社会福利
-        exclude_winner = [a for a in self.agents if a != winner]
-        exclude_value = self.solve_winner_determination(excluded_agents=[winner])
-        
-        # 3. 其他代理在最优分配中的福利总和
-        others_value = sum(
-            self.bundle_valuations.get((agent, self.agent_assignments.get(agent, ())), 0)
-            for agent in self.agents if agent != winner
-        )
-        
-        # VCG支付 = (排除i的社会福利) - (包含i时其他代理的福利)
-        return max(self.RESERVE_PRICE, exclude_value - others_value)
-
-    def solve_winner_determination(self, excluded_agents=[]):
-        """求解组合拍卖胜标问题（WDP）如文档7.2节"""
-        # 简化实现：实际需用整数规划优化（如分支定界）
-        candidates = []
-        available_agents = [a for a in self.agents if a not in excluded_agents]
-        available_targets = set(self.targets)
-        
-        # 生成所有可行分配组合
-        for bundle_size in range(1, len(available_targets)+1):
-            for bundle in combinations(available_targets, bundle_size):
-                for agent in available_agents:
-                    if bundle_size <= len(available_targets):
-                        val = self.bundle_valuations.get((agent, bundle), 0)
-                        candidates.append((val, agent, bundle))
-        
-        # 贪心选择最高价值分配
-        candidates.sort(reverse=True, key=lambda x: x[0])
-        allocated = set()
-        total_value = 0
-        
-        for val, agent, bundle in candidates:
-            if not set(bundle).intersection(allocated):
-                allocated.update(bundle)
-                total_value += val
-                if len(allocated) == len(available_targets):
-                    break
-                    
-        return total_value
-
-    def auction_process(self):
-        """执行整体投标的VCG拍卖（文档7.1节方案）"""
-        # 1. 收集组合投标
-        all_bids = []
-        for agent in self.agents:
-            # 代理提交所有可能组合的投标
-            for bundle in [combo for r in range(1, len(self.targets)+1) 
-                         for combo in combinations(self.targets, r)]:
-                bid_value = self.bundle_valuations.get((agent, bundle), 0)
-                all_bids.append((bid_value, agent, bundle))
-        
-        # 2. 胜标确定（WD问题）
-        all_bids.sort(reverse=True, key=lambda x: x[0])
-        allocated_targets = set()
-        self.assignments = {}
-        
-        for bid_value, agent, bundle in all_bids:
-            if not set(bundle).intersection(allocated_targets):
-                allocated_targets.update(bundle)
-                self.assignments[agent] = bundle
-                self.agent_assignments[agent] = bundle[0] if len(bundle)==1 else bundle
-                
-                # 3. VCG定价
-                self.payments[agent] = self.calculate_vcg_payment(agent, bundle)
-                
-                if len(allocated_targets) == len(self.targets):
-                    break
-        
-        # 保持原始输出格式（代理->单目标）
-        return {agent: bundle[0] if isinstance(bundle, tuple) else bundle
-                for agent, bundle in self.agent_assignments.items()}
-
 class Coordinator:
-    def __init__(self, robots, vlm_models):
+    def __init__(self, robots, vlm_models, *, decision_lambda=0.3,
+                 voting_alpha=0.7, valuation_scale=0.8, reserve_price=0.0):
         """
         初始化协调器
         :param robots: 机器人代理列表 [RobotAgent]
@@ -250,6 +160,21 @@ class Coordinator:
         """
         self.robots = robots
         self.vlm_models = vlm_models
+        for name, value in (("decision_lambda", decision_lambda),
+                            ("voting_alpha", voting_alpha)):
+            if not isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must lie in [0, 1]")
+        if not isfinite(valuation_scale) or valuation_scale <= 0:
+            raise ValueError("valuation_scale must be positive and finite")
+        if not isfinite(reserve_price) or reserve_price < 0:
+            raise ValueError("reserve_price must be nonnegative and finite")
+        self.decision_lambda = decision_lambda
+        self.voting_alpha = voting_alpha
+        self.valuation_scale = valuation_scale
+        self.reserve_price = reserve_price
+        self.robot_positions = {}
+        self.auction_result = None
+        self.Final_Bundles = {}
         self.discussion_history = []  # 讨论历史记录
         self.round = 1  # 当前讨论轮次
         self.max_rounds = 1
@@ -266,6 +191,11 @@ class Coordinator:
     # R1
     def run_discussion(self,agent_choice_reasons):
         """执行完整讨论流程"""
+        # Results belong to this round, even if discussion or voting is skipped.
+        self.Final_Decision = {}
+        self.Final_Bundles = {}
+        self.auction_result = None
+        self.r3_inputs = {}
         for round_num in range(1, self.max_rounds+1):
             # self._broadcast_messages(round_num)
             proposals = []
@@ -393,7 +323,10 @@ class Coordinator:
                 for robot in self.robots:
                     # print("robot.frontier_coords:",robot.frontier_coords)
                     all_frontier_letters = ['A', 'B', 'C', 'D'][:len(robot.frontier_coords[robot.id-1])]
-                    Frontier_Distances[robot.id] = calculate_frontier_distance(robot.frontier_coords[robot.id-1], all_frontier_letters, self.cur_start)
+                    position = self.robot_positions.get(robot.id, self.cur_start)
+                    if position is None:
+                        raise ValueError(f"missing map position for robot {robot.id}")
+                    Frontier_Distances[robot.id] = calculate_frontier_distance(robot.frontier_coords[robot.id-1], all_frontier_letters, position)
                     if robot.id != devil_robot_number:
                         R2_decision_prompt = form_decision_update_prompt(robot.id,
                             rebuttal_reason=Devil_Advocate['rebuttal']['rebuttal_reason'],
@@ -416,19 +349,22 @@ class Coordinator:
                         # print(Origin_Decision_Score)
                         assert len(Last_Choice_Score) == len(Origin_Decision_Score)
 
-                        Decision_Score[robot.id] = optimal_weighted_combination(Origin_Decision_Score, Last_Choice_Score)
+                        Decision_Score[robot.id] = optimal_weighted_combination(
+                            Last_Choice_Score, Origin_Decision_Score,
+                            weights=(self.decision_lambda, 1.0 - self.decision_lambda))
                     else:
                         Decision_Score[robot.id] = list(robot.origin_Decision_PR)
 
                 # 投票
-                R3_vote = calculate_R3_weighted_scores(Decision_Score, Frontier_Distances)
+                R3_vote = calculate_R3_weighted_scores(
+                    Decision_Score, Frontier_Distances, alpha=self.voting_alpha)
                 logging.info(f"Frontier_Distances: {Frontier_Distances}") #{1: {'A': 32.28002478313795, 'B': 82.00609733428362, 'C': 75.96051605933177, 'D': 102.95630140987001}, 2: {'A': 32.28002478313795, 'B': 82.00609733428362, 'C': 75.96051605933177, 'D': 102.95630140987001}}
                 logging.info(f"Decision_Score: {Decision_Score}") #{1: [0.277734375, 0.2745365853658536, 0.11404878048780487, 0.33411971227134146], 2: [0.0, 0.3473170731707317, 0.14536585365853658, 0.5073170731707317]}
                 logging.info(f"Voting_Score: {R3_vote}")
                 # print(self.available_targets) #['A', 'B', 'C', 'D']
 
         # 构建R2输出（投票固定值矩阵)
-        ## Legacy alternative kept only as commented reference
+        ## 这个仅在消融中使用(消融-去掉R3)
         # if len(self.available_targets) > 0:
         #     try:
         #         self.Final_Decision = {agent: self.available_targets[score.index(max(score))] for agent, score in Decision_Score.items()}
@@ -451,15 +387,33 @@ class Coordinator:
 
         # 2. 开始拍卖
         ## 定义类
-        if len(r3_inputs) >0:
+        self.auction_result = None
+        self.Final_Bundles = {}
+        if r3_inputs and not self.is_History:
             agents = []
             for robot in self.robots:
                 agents.append(robot.id)
-            auction = PriorityAuctionSystem(agents=agents, targets=self.available_targets, r3_inputs=r3_inputs)
+            auction = PriorityAuctionSystem(
+                agents=agents, targets=self.available_targets, r3_inputs=r3_inputs,
+                valuation_scale=self.valuation_scale, reserve_price=self.reserve_price)
             assignments = auction.auction_process()
+            # Commit only a complete, validated VCG settlement. Payments are
+            # consumed here with the resulting net utilities, not used to rerank.
+            result = auction.get_settled_result()
+            if not result.settled:
+                raise ValueError("auction returned an unsettled allocation")
+            self.auction_result = result
+            self.Final_Bundles = dict(result.bundles)
             self.Final_Decision = assignments
-
-            print("self.Final_Decision:",self.Final_Decision)
+            logging.info("VCGSettlement: %s", {
+                "round_id": self.round,
+                "consensus_lambda": self.decision_lambda,
+                "voting_alpha": self.voting_alpha,
+                "auction_beta": self.valuation_scale,
+                "reserve_price": self.reserve_price,
+                **result.as_dict(),
+            })
+        return self.auction_result
         
 
     def _prepare_r3_inputs(self, raw_outputs):
@@ -583,6 +537,7 @@ class RobotAgent:
         self.frontier_coords = None #前沿点信息（每个智能体）
         self.history_coords = None #历史点坐标
         self.origin_Decision_PR = None
+        self.navigation_mode = None
 
     def receive_messages(self, messages):
         """接收组内其他代理的消息"""
@@ -597,7 +552,11 @@ class RobotAgent:
         # )
         
         # 2. 构建结构化输出
-        proposal_type = "frontier" if self.JS >= 0.3 else "history" ##change!!!
+        # Use the exact mode selected by the main navigation loop. The fallback
+        # preserves compatibility with legacy callers that do not set it.
+        proposal_type = self.navigation_mode
+        if proposal_type is None:
+            proposal_type = "frontier" if self.JS >= 0.3 else "history"
         # proposal_type = "history" # debug历史节点，记得该回去
         
         response = {

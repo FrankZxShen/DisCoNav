@@ -19,7 +19,6 @@ import quaternion
 import pickle
 import io
 import re
-from copy import deepcopy
 
 from skimage import measure
 import skimage.morphology
@@ -36,22 +35,32 @@ from habitat.sims.habitat_simulator.actions import (
 
 from agents.vlm_agents import LLM_Agent
 from agents.vlm_agents_gt import LLM_Agent_GT
-from constants import *
+# from agents.llm_agents import LLM_Agent
+from constants import (
+    color_palette, coco_categories, coco_categories_hm3d2mp3d,
+    hm3d_category, category_to_id, object_category
+)
 from envs.habitat.multi_agent_env_vlm import Multi_Agent_Env
-from src.vlm import VLM, CogVLM2
-from src.SystemPrompt import *
-from src.GDP_agent import *
+# from envs.habitat.multi_agent_env import Multi_Agent_Env
+
+# from src.geom import get_cam_intr, get_scene_bnds
+from src.vlm import CogVLM2
+from src.SystemPrompt_origin import (
+    form_prompt_for_PerceptionVLM, 
+    form_prompt_for_FN,
+    form_prompt_for_DecisionVLM_Frontier,
+    Perception_weight_decision,
+    Perception_weight_decision4,
+)
+
 import utils.pose as pu
 
 import utils.visualization as vu
 
 from arguments import get_args
-# Optional legacy YOLOv9 backend:
+
 # from detect_yolov9 import Detect
 from detect.ultralytics import YOLOv10
-
-
-
 
 @habitat.registry.register_action_space_configuration
 class PreciseTurn(HabitatSimV1ActionSpaceConfiguration):
@@ -113,6 +122,52 @@ def all_agents_exit_true(agents):
             return False
     return True
 
+def ExtractExplorableAreas(full_map_pred, explo_area_map, VLM_PR, VLM_PR_last, color_map, count):
+    PR = VLM_PR[0]
+
+    # kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    full_w = full_map_pred.shape[1]
+
+    # local_ob_map = cv2.dilate(full_map_pred[0].cpu().numpy(), kernel)
+    show_ex = cv2.inRange(full_map_pred[1].cpu().numpy(), 0.1, 1)
+
+    kernel = np.ones((5, 5), dtype=np.uint8)
+    free_map = cv2.morphologyEx(show_ex, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(free_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    local_ob_map = cv2.dilate(full_map_pred[0].cpu().numpy(), kernel)
+    explo_area_map_cur = np.zeros_like(local_ob_map)
+
+    if len(contours) > 0:
+        for contour in contours:
+            if cv2.contourArea(contour) > 4: # Exclude very small areas from the example
+                cv2.drawContours(explo_area_map_cur, [contour], -1, PR, -1) # Fill the interior with PR
+
+    # Clear the border section
+    explo_area_map_cur[0:2, 0:full_w] = 0
+    explo_area_map_cur[full_w-2:full_w, 0:full_w] = 0
+    explo_area_map_cur[0:full_w, 0:2] = 0
+    explo_area_map_cur[0:full_w, full_w-2:full_w] = 0
+
+    if VLM_PR_last:
+        # mask = np.logical_and(explo_area_map_cur != PR, explo_area_map == VLM_PR_last[0])
+        coords = np.where(explo_area_map != 0)
+        # PR_coords = list(zip(coords[0], coords[1]))
+        explo_area_map_cur[coords] = explo_area_map[coords]
+
+    
+    # Mark explorable areas as current colour
+    intensity = int(PR * 100 * 2.55)
+    intensity = max(0, min(intensity, 100))
+    color_map[np.where(explo_area_map_cur == PR)] = [intensity, intensity, intensity]  #  RGB 值
+
+    lipped_map = cv2.flip(color_map, 0)
+    color_map__ = Image.fromarray(lipped_map)
+    color_map__ = color_map__.convert("RGB")
+
+    
+    return explo_area_map_cur, color_map
 
 def Frontiers(full_map_pred):
     # ------------------------------------------------------------------
@@ -165,8 +220,8 @@ def Frontiers(full_map_pred):
     #         cv2.line(original_image_color, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
     
-    img_label, num = measure.label(target_edge, connectivity=2, return_num=True)#输出二值图像中所有的连通域
-    props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
+    img_label, num = measure.label(target_edge, connectivity=2, return_num=True) # Output all connected fields in the binary image
+    props = measure.regionprops(img_label) # Output properties of connected fields, including area, etc.
 
     Goal_edge = np.zeros((img_label.shape[0], img_label.shape[1]))
     Goal_point = []
@@ -195,7 +250,7 @@ def Frontiers(full_map_pred):
 
     return Wall_lines, Goal_area_list, Goal_edge, Goal_point
 
-# 画出长期导航目标点
+# 画出所有的Frontier
 def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, Frontiers_dict, goal_points):
     dump_dir = "{}/dump/{}/".format(args.dump_location,
                                     args.exp_name)
@@ -235,8 +290,8 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
 
 
     def find_big_connect(image):
-        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
-        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
+        img_label, num = measure.label(image, return_num=True) # Output all connected fields in the binary image
+        props = measure.regionprops(img_label) # Output properties of connected fields, including area, etc.
         # print("img_label.shape: ", img_label.shape) # 480*480
         resMatrix = np.zeros(img_label.shape)
         tmp_area = 0
@@ -268,7 +323,7 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
     elif len(goal_points) == args.num_agents and goal_points[i][0] != 9999:
         for i in range(args.num_agents):
             goal = np.zeros((full_w, full_w)) 
-            goal[goal_points[i][1], goal_points[i][0]] = 1
+            goal[goal_points[i][0], goal_points[i][1]] = 1
             selem = skimage.morphology.disk(4)
             goal_mat = 1 - skimage.morphology.binary_dilation(
                 goal, selem) != True
@@ -324,20 +379,20 @@ def Visualize(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visi
                 number = float(match.group(3))
                 # print(f"Centroid: ({centroid_x}, {centroid_y})")
                 # print(f"Number: {number}")
-                cv2.circle(sem_map_vis, (centroid_x, d240(centroid_y)), 5, color_black, -1)
-                # cv2.circle(sem_map_vis, (centroid_x, centroid_y), 5, color_black, -1)
+                
+                cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_black, -1)
                 label = f"{alpha[alpha0]}"
                 alpha0 += 1
-                cv2.putText(sem_map_vis, label, (centroid_x + 5, d240(centroid_y) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
-                # cv2.putText(sem_map_vis, label, (centroid_x + 5, centroid_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
+                cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
     for i in range(args.num_agents):
         agent_arrow = vu.get_contour_points(pose_pred[i], origin=(15, 50), size=10)
 
         cv2.drawContours(vis_image, [agent_arrow], 0, color[i], -1)
-    # if args.visualize:
-    #     # Displaying the image
-    #     cv2.imshow("episode_n {}".format(episode_n), vis_image)
-    #     cv2.waitKey(1)
+    if args.visualize:
+        # Displaying the image
+        # cv2.imshow("episode_n {}".format(episode_n), vis_image)
+        # cv2.waitKey(1)
+        pass
 
     if args.print_images:
         fn = '{}/episodes/eps_{}/Step-{}.png'.format(
@@ -355,7 +410,6 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
 
     sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
 
-    # if l_step != 0:
     sem_map += 5
 
     # no_cat_mask = sem_map == 20
@@ -378,14 +432,10 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
         sem_map[visited_vis[i] == 1] = 3+i
     sem_map[edge_mask] = 3
 
-    # Del Traj
-    sem_map[sem_map == 3] = 2
-    # Del long-time goal
-    sem_map[sem_map == 4] = 2
 
     def find_big_connect(image):
-        img_label, num = measure.label(image, return_num=True)#输出二值图像中所有的连通域
-        props = measure.regionprops(img_label)#输出连通域的属性，包括面积等
+        img_label, num = measure.label(image, return_num=True) # Output all connected fields in the binary image
+        props = measure.regionprops(img_label) # Output properties of connected fields, including area, etc.
         # print("img_label.shape: ", img_label.shape) # 480*480
         resMatrix = np.zeros(img_label.shape)
         tmp_area = 0
@@ -425,20 +475,20 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
 
             sem_map[goal_mask] = 3 + i
     pattern = r'<centroid: (.*?), (.*?), number: (.*?)>'
-    # if Frontiers_dict:
-    #     for keys, value in Frontiers_dict.items():
-    #         match = re.match(pattern, value)
-    #         if match:
-    #             centroid_x = int(match.group(1)[1:])
-    #             centroid_y = int(match.group(2)[:-1])
-    #             number = float(match.group(3))
-    #         fgoal = np.zeros((full_w, full_w)) 
-    #         fgoal[centroid_x, centroid_y] = 1
-    #         selem = skimage.morphology.disk(4)
-    #         goal_mat = 1 - skimage.morphology.binary_dilation(
-    #             fgoal, selem) != True
-    #         goal_mask = goal_mat == 1
-            # sem_map[goal_mask] = 2
+    if Frontiers_dict:
+        for keys, value in Frontiers_dict.items():
+            match = re.match(pattern, value)
+            if match:
+                centroid_x = int(match.group(1)[1:])
+                centroid_y = int(match.group(2)[:-1])
+                number = float(match.group(3))
+            fgoal = np.zeros((full_w, full_w)) 
+            fgoal[centroid_x, centroid_y] = 1
+            selem = skimage.morphology.disk(4)
+            goal_mat = 1 - skimage.morphology.binary_dilation(
+                fgoal, selem) != True
+            goal_mask = goal_mat == 1
+            sem_map[goal_mask] = 2
 
     
     color = []
@@ -458,11 +508,6 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
     sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
                                 interpolation=cv2.INTER_NEAREST)
-
-    sem_map_origin = deepcopy(sem_map_vis)
-
-    # if l_step == 0:
-    #     sem_map -= 5
 
     color_black = (0,0,0)
     color_green = (0,255,0)
@@ -489,7 +534,6 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     # agent_arrow = vu.get_contour_points(pose_pred[agent_j], origin=(0, 0), size=10)
 
     # cv2.drawContours(sem_map_vis, [agent_arrow], 0, color[agent_j], -1)
-    # 画出前沿点
     if Frontiers_dict:
         for keys, value in Frontiers_dict.items():
             match = re.match(pattern, value)
@@ -499,44 +543,34 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
                 number = float(match.group(3))
                 # print(f"Centroid: ({centroid_x}, {centroid_y})")
                 # print(f"Number: {number}")
-
                 
-                cv2.circle(sem_map_vis, (centroid_x, d240(centroid_y)), 5, color_black, -1)
-                # cv2.circle(sem_map_vis, (centroid_x, centroid_y), 5, color_black, -1)
-
+                cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_black, -1)
                 label = f"{alpha[alpha0]}"
                 alpha0 += 1
-                cv2.putText(sem_map_vis, label, (centroid_x + 5, d240(centroid_y) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
-                # cv2.putText(sem_map_vis, label, (centroid_x + 5, centroid_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
+                cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_black, 1)
 
     sem_map_vis2 = sem_map_vis.copy()
     beta = [chr(ord("a") + i) for i in range(26)]
     alpha0 = 0
-    # 画出历史点
     if len(history_nodes) > 0:
         for hs in history_nodes[:26]:
             centroid_x = int(hs[0])
             centroid_y = int(hs[1])
             cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            # cv2.circle(sem_map_vis, (centroid_x, centroid_y), 5, color_green, -1)
             label = f"{beta[alpha0]}"
             alpha0 += 1
             cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-            # cv2.putText(sem_map_vis, label, (centroid_x + 5, centroid_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
         alpha0 = 0
         for hs in history_nodes[26:]:
             centroid_x = int(hs[0])
             centroid_y = int(hs[1])
             cv2.circle(sem_map_vis, (centroid_y, d240(centroid_x)), 5, color_green, -1)
-            # cv2.circle(sem_map_vis, (centroid_x, centroid_y), 5, color_green, -1)
             label = f"{alpha[alpha0]}"
             alpha0 += 1
             cv2.putText(sem_map_vis, label, (centroid_y + 5, d240(centroid_x) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-            # cv2.putText(sem_map_vis, label, (centroid_x + 5, centroid_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_green, 1)
-    
-    # 遍历字典并绘制文本
+    # Iterate through the dictionary and draw polygons
     for key, value in agents_seg_list.items():
-        # 将每个 value 转换成适合 cv2.polylines 使用的格式（一个 numpy 数组）
+        # Convert each value into a format suitable for use with cv2.polylines (a numpy array).
         for array in value:
             pts = array.reshape((-1, 1, 2))
             if agent_j == 0:
@@ -544,10 +578,10 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
                     for j in i:
                         j[1] = d240(j[1])
             
-            # 绘制多边形
+            # Draw polygons
             # cv2.polylines(sem_map_vis, [pts], isClosed=True, color=color_bule, thickness=2)
             
-            # 标注key值，文本位置选在多边形的第一个坐标处
+            # Label the key values with the text at the first coordinate of the polygon.
             text_position = (pts[0][0][0], pts[0][0][1])
             # moments = cv2.moments(pts)
             # cX = int(moments["m10"] / moments["m00"])
@@ -556,7 +590,7 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
             cv2.putText(sem_map_vis2, key, text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     
 
-    # 画出箭头
+    # Draw the arrows
     # cv2.circle(sem_map_vis, (int(pose_pred[agent_j][0]), int(pose_pred[agent_j][1])), 8, color_red, -1)
     # cv2.circle(sem_map_vis2, (int(pose_pred[agent_j][0]), int(pose_pred[agent_j][1])), 8, color_red, -1)
     
@@ -566,8 +600,7 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     if pre_goal_point:
         cv2.circle(sem_map_vis, (int(pre_goal_point[1]), int(d240(pre_goal_point[0]))), 8, color_blue, -1)
         cv2.circle(sem_map_vis2, (int(pre_goal_point[1]), int(d240(pre_goal_point[0]))), 8, color_blue, -1)
-        # cv2.circle(sem_map_vis, (int(pre_goal_point[0]), int(pre_goal_point[1])), 8, color_blue, -1)
-        # cv2.circle(sem_map_vis2, (int(pre_goal_point[0]), int(pre_goal_point[1])), 8, color_blue, -1)
+
     
     
     
@@ -585,29 +618,134 @@ def Decision_Generation_Vis(args, agents_seg_list, agent_j, episode_n, l_step, p
     fn2 = '{}/episodes/eps_{}/Agents_vis/VisStep2-{}.png'.format(
                         dump_dir, episode_n,
                         l_step)
+    cv2.imwrite(fn, sem_map_vis)  
+    cv2.imwrite(fn2, sem_map_vis2) 
+
+    return sem_map_vis, sem_map_vis2
+
+
+
+def Visualize0(args, episode_n, l_step, pose_pred, full_map_pred, goal_name, visited_vis, map_edge, goal_points):
+    dump_dir = "{}/dump/{}/".format(args.dump_location,
+                                    args.exp_name)
+    ep_dir = '{}/episodes/eps_{}/'.format(
+        dump_dir, l_step)
+    if not os.path.exists(ep_dir):
+        os.makedirs(ep_dir)
+
+    full_w = full_map_pred.shape[1]
+
+    map_pred = full_map_pred[0, :, :].cpu().numpy()
+    exp_pred = full_map_pred[1, :, :].cpu().numpy()
+
+    sem_map = full_map_pred[4:, :,:].argmax(0).cpu().numpy()
+
+    sem_map += 5
+
+    if 'objectnav_hm3d' in args.task_config:
+        no_cat_mask = sem_map == len(object_category) - 2
+    elif 'objectnav_mp3d' in args.task_config:
+        no_cat_mask = sem_map == len(object_category) - 2 + 5
+    map_mask = np.rint(map_pred) == 1
+    exp_mask = np.rint(exp_pred) == 1
+    edge_mask = map_edge == 1
+
+    sem_map[no_cat_mask] = 0
+    m1 = np.logical_and(no_cat_mask, exp_mask)
+    sem_map[m1] = 2
+
+    m2 = np.logical_and(no_cat_mask, map_mask)
+    sem_map[m2] = 1
+
+    for i in range(args.num_agents):
+        sem_map[visited_vis[i] == 1] = 3+i
+    sem_map[edge_mask] = 3
+
+
+    def find_big_connect(image):
+        img_label, num = measure.label(image, return_num=True) # Output all connected fields in the binary image
+        props = measure.regionprops(img_label) # Output properties of connected fields, including area, etc.
+        # print("img_label.shape: ", img_label.shape) # 480*480
+        resMatrix = np.zeros(img_label.shape)
+        tmp_area = 0
+        for i in range(0, len(props)):
+            if props[i].area > tmp_area:
+                tmp = (img_label == i + 1).astype(np.uint8)
+                resMatrix = tmp
+                tmp_area = props[i].area 
+        
+        return resMatrix
+
+    goal = np.zeros((full_w, full_w)) 
+    if 'objectnav_mp3d' in args.task_config:
+        cn = goal_name + 4
+    elif 'objectnav_hm3d' in args.task_config:
+        cn = coco_categories[goal_name] + 4
+    if full_map_pred[cn, :, :].sum() != 0.:
+        cat_semantic_map = full_map_pred[cn, :, :].cpu().numpy()
+        cat_semantic_scores = cat_semantic_map
+        cat_semantic_scores[cat_semantic_scores > 0] = 1.
+        goal = find_big_connect(cat_semantic_scores)
+
+        selem = skimage.morphology.disk(4)
+        goal_mat = 1 - skimage.morphology.binary_dilation(
+            goal, selem) != True
+
+        goal_mask = goal_mat == 1
+        sem_map[goal_mask] = 4
+    elif len(goal_points) == args.num_agents:
+        for i in range(args.num_agents):
+            goal = np.zeros((full_w, full_w)) 
+            goal[goal_points[i][0], goal_points[i][1]] = 1
+            selem = skimage.morphology.disk(4)
+            goal_mat = 1 - skimage.morphology.binary_dilation(
+                goal, selem) != True
+            goal_mask = goal_mat == 1
+
+            sem_map[goal_mask] = 3 + i
+
+
+    color_pal = [int(x * 255.) for x in color_palette]
+    sem_map_vis = Image.new("P", (sem_map.shape[1],
+                                    sem_map.shape[0]))
+    sem_map_vis.putpalette(color_pal)
+    sem_map_vis.putdata(sem_map.flatten().astype(np.uint8))
+    sem_map_vis = sem_map_vis.convert("RGB")
+    sem_map_vis = np.flipud(sem_map_vis)
+
+    sem_map_vis = sem_map_vis[:, :, [2, 1, 0]]
+    sem_map_vis = cv2.resize(sem_map_vis, (480, 480),
+                                interpolation=cv2.INTER_NEAREST)
+
+    color = []
+    for i in range(args.num_agents):
+        color.append((int(color_palette[11+3*i] * 255),
+                    int(color_palette[10+3*i] * 255),
+                    int(color_palette[9+3*i] * 255)))
+
+    vis_image = vu.init_multi_vis_image(category_to_id[goal_name], color)
+
+    vis_image[50:530, 15:495] = sem_map_vis
+
+    for i in range(args.num_agents):
+        agent_arrow = vu.get_contour_points(pose_pred[i], origin=(15, 50), size=10)
+
+        cv2.drawContours(vis_image, [agent_arrow], 0, color[i], -1)
+
     if args.visualize:
-        cv2.imwrite(fn, sem_map_vis)  
-        cv2.imwrite(fn2, sem_map_vis2) 
+        # Displaying the image
+        # cv2.imshow("episode_n {}".format(episode_n), vis_image)
+        # cv2.waitKey(1)
+        pass
 
-    return sem_map_vis, sem_map_vis2, sem_map_origin
-
-
-def map_frontiers_to_letters(frontier_keys):
-    # 提取每个 key 的编号
-    indices = [int(key.split('_')[1]) for key in frontier_keys]
-    # 找出最大编号，用于生成完整字母表
-    max_index = max(indices) if indices else 0
-    # 构建完整编号到字母的映射（例如 0→A, 1→B, 2→C, ...）
-    index_to_letter = {i: chr(65 + i) for i in range(max_index + 1)}
-    # 根据原始 frontier 返回对应字母
-    return [index_to_letter[int(key.split('_')[1])] for key in frontier_keys]
+    if args.print_images:
+        fn = '{}/episodes/eps_{}/Vis-{}.png'.format(
+            dump_dir, episode_n,
+            l_step)
+        cv2.imwrite(fn, vis_image)
 
 def calculate_distance(coord1, coord2):
     return math.sqrt((coord1[0] - coord2[0]) ** 2 + (coord1[1] - coord2[1]) ** 2)
-
-
-
-
 
 def main():
     args = get_args()
@@ -617,11 +755,8 @@ def main():
 
     device = torch.device("cuda:0" if args.cuda else "cpu")
 
-    # logging.info(f"stride:{stride}")
-    # logging.info(f"names:{names}")
-    # logging.info(f"pt:{pt}")
-
-
+###########################################################===Load Models and Datasets===########################################################
+    # Initialise habitat
     HabitatSimActions.extend_action_space("TURN_LEFT_S")
     HabitatSimActions.extend_action_space("TURN_RIGHT_S")
 
@@ -652,11 +787,15 @@ def main():
     config_env.SIMULATOR.ACTION_SPACE_CONFIG = "PreciseTurn"
     config_env.freeze()
 
+    # ------------------------------------------------------------------
     # Load VLM
+    # ------------------------------------------------------------------
     # vlm = VLM(args.vlm_model_id, args.hf_token, device)
     base_url = args.base_url 
     cogvlm2 = CogVLM2(base_url) 
+    # ------------------------------------------------------------------
     # Load Yolo
+    # ------------------------------------------------------------------
     # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
     if args.yolo == 'yolov9':
         # yolo = Detect(imgsz=(args.env_frame_height, args.env_frame_width), device=device)
@@ -665,6 +804,7 @@ def main():
         yolo = YOLOv10.from_pretrained(args.yolo_weights)
     # print(config_env)
     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+
     
     env = Multi_Agent_Env(config_env=config_env)
 
@@ -718,7 +858,6 @@ def main():
     count_episodes = 0
     count_step = 0
     goal_points = []
-    robots = []
     
     log_start = time.time()
     last_decision = []
@@ -745,8 +884,8 @@ def main():
 
     # logging.info(f"num agents: {num_agents}")
 
+###########################################################===Main MCoCoNav===########################################################
     while count_episodes < num_episodes:
-        # for ii in range(1,12):
         observations = env.reset()
         for i in range(num_agents):
             agent[i].reset()
@@ -761,27 +900,14 @@ def main():
         target_point.clear()
 
         goal_points.clear()
-        robots.clear()
-
-        # 初始化协调器
-        coordinator = Coordinator(
-                robots=robots,
-                vlm_models=cogvlm2,
-            )
-        # 初始化机器人
         for j in range(num_agents):
             goal_points.append([0, 0])
-            robot = RobotAgent(robot_id=j+1,vlm_models=cogvlm2,)
-            robots.append(robot)
-        
 
         while not env.episode_over:
-                
-            all_rgb = [] # 用于保存每个智能体的
-            # all_objs = [] # 记录每个时间步每个智能体的目标检测信息
-            # all_VLM_Pred = [] # 记录每个时间步中每个智能体的VLM预测结果
-            # all_VLM_PR = [] # 记录每个时间步中每个智能体的PR分数
-            Local_Policy = 0 # 何时调用local policy
+            
+            all_rgb = [] # hold the rgb of each robot
+
+            Local_Policy = 0 # local policy
             start = time.time()
             count_rotating = 0
             action = []
@@ -793,22 +919,12 @@ def main():
             full_map1 = []
             visited_vis = []
             pose_pred = []
-            agent_objs = {} # 记录单个时间步内每个智能体的目标检测信息
-            agents_VLM_Rel = {} # 记录单个时间步内（每个角度）每个智能体的VLM预测分数
-            agents_VLM_Pred = {} # 记录单个时间步内（每个角度）每个智能体的VLM预测结果
-            agents_VLM_PR = {} # 记录单个时间步内（每个角度）每个智能体的VLM PR分数
+            agent_objs = {} # Record target detection information for each smart body in a single time step
 
-            agent_FrontierList = [] # 记录智能体Frontier
+            agent_FrontierList = [] # Record the robot Frontier
             agent_TargetEdgeMap = []
             agent_TargetPointMap = []
             agent_MapPred = []
-
-            R1Proposals = []
-            # 初始化agent_choice_reason
-            agent_choice_reasons = []
-
-            frontier_coords = []
-
 
             for i in range(num_agents):
                 agent[i].mapping(observations[i])
@@ -842,62 +958,38 @@ def main():
 
             if agent[0].l_step % args.num_local_steps == args.num_local_steps - 1 or agent[0].l_step == 0:
                 for j in range(num_agents):
-                    # goal_points[j] = [9999, 9999]
-                    # agent[j].EXIT = False
                     agent[j].Perception_PR = 0
-                    # agent[j].Max_Perception_Angle = 360
-                    # agent[j].count_rerotation = 0
-                    robots[j].target_object=agent[0].goal_name
-
+                
                 agents_seg_list = Objects_Extract(args, full_map_pred, args.use_sam)
 
                 pre_goal_points.clear()
-                frontier_coords.clear()
                 if len(cur_goal_points) > 0:
                     pre_goal_points = cur_goal_points.copy()
                     cur_goal_points.clear()
-                
-                if len(full_target_point_map) > 0:
-                    No_Frontier_Group = False
-                    full_Frontiers_dict = {}
-
                     
+                if len(full_target_point_map) > 0:
+                    full_Frontiers_dict = {}
                     for j in range(len(full_target_point_map)):
-                        full_Frontiers_dict['frontier_' + str(j)] = f"<centroid: {full_target_point_map[j][1], full_target_point_map[j][0]}, number: {full_Frontier_list[j]}>"
+                        full_Frontiers_dict['frontier_' + str(j)] = f"<centroid: {full_target_point_map[j][0], full_target_point_map[j][1]}, number: {full_Frontier_list[j]}>"
                     logging.info(f'=====> Frontier: {full_Frontiers_dict}')
 
                     if len(history_nodes) > 0:
                         logging.info(f'=====> history_nodes: {history_nodes}')
                         logging.info(f'=====> history_score: {history_score}')
 
-                    # full_sem_map = Decision_Generation_Vis(args, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
-                    #                 agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points)
-                        
-                    # VLM_Decision_Prompt_Meta = form_prompt_for_DecisionVLM_MetaPreprocess()
-                    # _, Decision_Pred_Meta = cogvlm2.simple_image_chat(User_Prompt=VLM_Decision_Prompt_Meta, 
-                    #                                                                 return_string_probabilities=None, img=full_sem_map)
-                    # Decision_Pred_Meta = '''
-                    # Scenario exploration analysis module: Yes
-                    # Scene object detection module: Yes
-                    # Scenario exploration analysis module: Yes
-                    # '''
-                    ##### VLM Process :>
 
-                    # Decisions = []
-                    # full_rgb1 = []
-                    MCoCo_Decision_COTs = []
-                    frontier_keys = [f'frontier_{i}' for i in range(len(full_Frontiers_dict))]
-
+                    # ------------------------------------------------------------------
+                    ##### VLM Preliminaries :>
+                    # ------------------------------------------------------------------
                     for j in range(num_agents):
                         agent[j].is_Frontier = True
-                        # rgb = observations[j]['rgb'].astype(np.uint8)
-                        rgb = cv2.cvtColor(observations[j]['rgb'].astype(np.uint8), cv2.COLOR_RGB2BGR)
+                        rgb = observations[j]['rgb'].astype(np.uint8)
                         
                         # full_rgb1.append(full_rgb)
                         all_rgb.append(rgb)
                         goal_name = agent[j].goal_name
                         if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # 记录一个时间步内每个智能体的目标检测信息
+                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # Record target detection information for each robot in a single time step.
                         else:
                             yolo_output = yolo(source=rgb,conf=0.2)
                             yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
@@ -926,42 +1018,34 @@ def main():
                         if len(pre_goal_points) > 0:
                             # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
                             #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
-                            sem_map, sem_map_frontier, sem_map_origin = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
+                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
                                     agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=pre_goal_points[j])
                         else:
                             # sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, agent_MapPred[j], 
                             #                 agent[j].goal_id, visited_vis[j], agent_TargetEdgeMap[j], history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
-                            sem_map, sem_map_frontier, sem_map_origin = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
+                            sem_map, sem_map_frontier = Decision_Generation_Vis(args, agents_seg_list, j, agent[0].episode_n, agent[0].l_step, pose_pred, full_map_pred, 
                                     agent[0].goal_id, visited_vis, full_target_edge_map, history_nodes, full_Frontiers_dict, goal_points=[], pre_goal_point=None)
                         # full_rgb = np.hstack((rgb, sem_map))
-                        # print("full_Frontiers_dict:",full_Frontiers_dict)
-                        # print("history_nodes:",history_nodes)
-                        # 保存sem_map
-                        # cv2.imwrite(f"Sem_map_{agent[0].episode_n}_{agent[0].l_step}_{j}.png", sem_map)
 
-                        #### 感知VLM
-                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
                         
+                        # ------------------------------------------------------------------
+                        #### Perception VLM
+                        # ------------------------------------------------------------------
+                        Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
                         _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
                                                                         return_string_probabilities=None, img=rgb)
-                        
-                        # print(Scene_Information)
-                        # exit()
                         Perception_Rel, Perception_Pred = cogvlm2.COT2(User_Prompt1=Caption_Prompt, 
                                                                        User_Prompt2=VLM_Perception_Prompt,
                                                                        cot_pred1=Scene_Information,
                                                                        return_string_probabilities="[Yes, No]", img=rgb)
-                        
                         Perception_Rel = np.array(Perception_Rel)
-                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred) # ES
-                        # logging.info(f"Scene_Information: {Scene_Information}")
-                        # print("Perception_Pred:",Perception_Pred)
+                        Perception_PR = Perception_weight_decision(Perception_Rel, Perception_Pred)
                         logging.info(f"Agent_{j}--VLM_PerceptionPR: {Perception_PR}")
-                        
+                        # agents_VLM_Rel[f"Agent_{i}--VLM_PerceptionRel"] = Perception_Rel
+                        # agents_VLM_Pred[f"Agent_{i}--VLM_PerceptionPred"] = Perception_Pred
+                        # agents_VLM_PR[f"Agent_{i}--VLM_PerceptionPR"] = Perception_PR
 
-                        robots[j].ES = Perception_PR[0]
-                        robots[j].global_map = sem_map_origin
-                        coordinator.global_map = sem_map_origin
+                        
 
                         is_exist_oldhistory = False
                         if len(history_nodes) > 0:
@@ -990,17 +1074,14 @@ def main():
 
                         
                         cur_goal_points.append(start)
-                        MCoCo_Decision_COT = {}
+
                         if len(agent_TargetPointMap[j]) > 0:
-                            
-                            # Frontiers_dict = {}
-                            # for k in range(len(agent_TargetPointMap[j])):
-                            #     Frontiers_dict['frontier_' + str(k)] = f"<centroid: {agent_TargetPointMap[j][k][0], agent_TargetPointMap[j][k][1]}, number: {agent_FrontierList[j][k]}>"
-                            # Agent States
                             
                             logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
 
-                            ### f/n 判断VLM
+                            # ------------------------------------------------------------------
+                            #### Judgment VLM
+                            # ------------------------------------------------------------------
                             if len(history_nodes) > 0:
                                 if len(pre_goal_points) > 0:
                                     FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points[j], full_Frontiers_dict, start, history_nodes)
@@ -1008,12 +1089,6 @@ def main():
                                     FN_Prompt = form_prompt_for_FN(goal_name, agents_seg_list, Perception_PR, pre_goal_points, full_Frontiers_dict, start, history_nodes)
                                 # logging.info(FN_Prompt)
                                 
-                                # 舍弃思维链1
-                                # FN_Rel, FN_Decision = cogvlm2.COT2(User_Prompt1=VLM_Perception_Prompt, 
-                                #                                     User_Prompt2=FN_Prompt,
-                                #                                     cot_pred1=Perception_Pred,
-                                #                                     return_string_probabilities="[Yes, No]", img=full_rgb)
-                                # logging.info(FN_Decision)
                                 FN_Rel, FN_Decision = cogvlm2.simple_image_chat(User_Prompt=FN_Prompt, 
                                                                                         return_string_probabilities="[Yes, No]", img=sem_map)
 
@@ -1021,6 +1096,8 @@ def main():
                                 logging.info(f"Agent_{j}--FN_PR: {FN_PR}")
                                 if FN_PR == 'Neither':
                                     FN_PR = FN_Rel
+
+                                
                                 
                                 angle_score = Perception_PR[0] * 2 + FN_PR[0]
                                 agent[j].angle_score = angle_score
@@ -1051,96 +1128,54 @@ def main():
                                     h_score = history_states[closest_index].sum() / history_count[closest_index]
                                     history_score[closest_index] = h_score
 
-
-                            # Module_Prompt = form_prompt_for_Module_Decision(goal_name, Decision_Pred_Meta, agent_objs[f"agent_{j}"])
-                            # FN = True
-
-                            ### 决策VLM-组内目标协商
-
                             logging.info(f'=====> history_nodes: {history_nodes}')
                             logging.info(f'=====> history_score: {history_score}')
                             # Scores = []
                             if j == 0:
-                                # frontier_names = [f'frontier_{i}' for i in range(len(full_Frontiers_dict))] 
-                                coordinator.available_targets = ['A', 'B', 'C', 'D'][:len(full_Frontiers_dict)]
                                 history_nodes_copy = history_nodes.copy()
                                 history_score_copy = history_score.copy()
                                 full_Frontiers_dict_copy = full_Frontiers_dict.copy()
                             else:
                                 missing_key_F = []
-                                frontier_keys = [f'frontier_{i}' for i in range(len(full_Frontiers_dict))]
+                                if len(full_Frontiers_dict) == 4:
+                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
+                                elif len(full_Frontiers_dict) == 3:
+                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
+                                elif len(full_Frontiers_dict) == 2:
+                                    frontier_keys = ['frontier_0', 'frontier_1']
+                                else:
+                                    frontier_keys = ['frontier_0']
 
                                 for element in full_Frontiers_dict.keys():
                                     if element not in full_Frontiers_dict_copy.keys():
                                         missing_key_F.append(element)
-
-
-                            robots[j].JS = FN_PR[0]
-                            frontier_coords.append(full_Frontiers_dict.copy())
-                            robots[j].history_coords = history_nodes
-                            # FN_PR[0] >= 0.3就相当于ES*JS，选择Frontier
-
-                            if FN_PR[0] >= 0.3 or agent[j].l_step <= 125:
-                            # if agent[j].l_step >= 125: # debug历史节点，记得该回去
-                                # print("agent:",j)
-                                # print("full_Frontiers_dict_copy:",full_Frontiers_dict_copy)
-                                
+                                # for element in history_nodes:
+                                #     if element not in history_nodes_copy:
+                                #         missing_index_H.append(element.index(element))
+                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
+                                # ------------------------------------------------------------------
+                                #### Decision VLM
+                                # ------------------------------------------------------------------
                                 if len(pre_goal_points) > 0:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(
-                                        Scene_Information, 
-                                        agents_seg_list, 
-                                        pre_goal_points[j], 
-                                        goal_name, 
-                                        start, 
-                                        full_Frontiers_dict_copy,
-                                        coordinator.available_targets
-                                    )
+                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points[j], goal_name, start, full_Frontiers_dict_copy)
                                 else:
-                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(
-                                        Scene_Information, 
-                                        agents_seg_list, 
-                                        pre_goal_points, 
-                                        goal_name, 
-                                        start, 
-                                        full_Frontiers_dict_copy,
-                                        coordinator.available_targets
-                                        )
+                                    Meta_Prompt = form_prompt_for_DecisionVLM_Frontier(Scene_Information, agents_seg_list, pre_goal_points, goal_name, start, full_Frontiers_dict_copy)
                                 
                                 Meta_Score, Meta_Choice = cogvlm2.simple_image_chat(User_Prompt=Meta_Prompt,
                                                             return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
+
+                                Final_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
                                 
-
-                                # Meta_Score, Meta_Choice = cogvlm2.COT2(User_Prompt1=Single_Prompt, 
-                                #                             User_Prompt2=Meta_Prompt,
-                                                            # cot_pred1=Single_Choice,
-                                                            # return_string_probabilities="[A, B, C, D]", img=sem_map_frontier)
-                                Decision_PR = Perception_weight_decision4(Meta_Score, Meta_Choice)
-                                Choice = Decision_PR.index(max(Decision_PR[:len(full_Frontiers_dict_copy)]))
-
-                                coordinator.cur_start = start
-                                robots[j].DS = Decision_PR[Choice]
-                                robots[j].origin_Decision_PR = Decision_PR
-
                             else:
-                                # 由于不稳定性，将其替换为分数最高的nodes
-                                # Meta_Prompt = form_prompt_for_DecisionVLM_History(pre_goal_points[j], goal_name, start, history_score_copy, history_nodes_copy)
-                                # Meta_Score, Meta_Choice = cogvlm2.COT3(User_Prompt1=VLM_Perception_Prompt, 
-                                #                             User_Prompt2=FN_Prompt,
-                                                            # User_Prompt3=Meta_Prompt,
-                                                            # cot_pred1=Perception_Pred,
-                                                            # cot_pred2=FN_Decision,
-                                                            # return_string_probabilities="[a, b, c, d]", img=full_rgb)
-                                # Decisions.append(Meta_Choice)
-                                # Decision_PR = Perception_weight_decision26(Meta_Score, Meta_Choice)
-                                Decision_PR = history_score_copy
-                                Choice = Decision_PR.index(max(Decision_PR))
-                                robots[j].DS = Decision_PR[Choice] / sum(Decision_PR)
-                                robots[j].origin_Decision_PR = Decision_PR
+                                Final_PR = history_score_copy
 
-                            logging.info(f"Agent_{j}--Decision_PR: {Decision_PR}")
+                            logging.info(f"Agent_{j}--Final_PR: {Final_PR}")
+
+                            # Scores.append(Final_PR)
+                            Choice = Final_PR.index(max(Final_PR))
                             
-                            if FN_PR[0] >= 0.3 or agent[j].l_step <= 125:
-                            # if agent[j].l_step >= 125: # debug历史节点，记得该回去
+                            
+                            if FN_PR[0] >= 0.5 or agent[j].l_step <= 125:
                                 logging.info(f"VLM Choice: Agent_{j}-frontier_{Choice}")
                                 Choice2 = Meta_Score.index(max(Meta_Score))
 
@@ -1167,25 +1202,22 @@ def main():
                                         for i, key in enumerate(frontier_keys):
                                             goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
                                 
-                                else: # 
+                                
+                                else:
                                     if j > 0:
                                         if len(missing_key_F) != 0:
                                             for keys in missing_key_F:
                                                 frontier_keys.remove(keys)
-                                        
                                     else:
-                                        # if len(full_Frontiers_dict) == 4:
-                                        #     frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
-                                        # elif len(full_Frontiers_dict) == 3:
-                                        #     frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
-                                        # elif len(full_Frontiers_dict) == 2:
-                                        #     frontier_keys = ['frontier_0', 'frontier_1']
-                                        # else:
-                                        #     frontier_keys = ['frontier_0']
-                                        frontier_keys = [f'frontier_{i}' for i in range(len(full_Frontiers_dict))]
-                                    # print(frontier_keys)
-                                    frontiers = map_frontiers_to_letters(frontier_keys) # A, B, C, D的字母列表，用于
-                                    
+                                        if len(full_Frontiers_dict) == 4:
+                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
+                                        elif len(full_Frontiers_dict) == 3:
+                                            frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2']
+                                        elif len(full_Frontiers_dict) == 2:
+                                            frontier_keys = ['frontier_0', 'frontier_1']
+                                        else:
+                                            frontier_keys = ['frontier_0']
+
                                     invalid_answer = False
                                     for i, key in enumerate(frontier_keys):
                                         if Choice == i:
@@ -1200,11 +1232,11 @@ def main():
                                             if Choice2 == i:
                                                 try:
                                                     goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    full_Frontiers_dict_copy[key]
+                                                    del full_Frontiers_dict_copy[key]
                                                     break
                                                 except:
                                                     goal_points[j] = [int(x) for x in full_Frontiers_dict_copy[frontier_keys[0]].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                                    full_Frontiers_dict_copy[key]
+                                                    del full_Frontiers_dict_copy[frontier_keys[0]]
                                                     break
                                         
 
@@ -1219,57 +1251,12 @@ def main():
                                             del history_nodes_copy[i]
                                             del history_score_copy[i]
                                             break
-                            
-                            #===执行组内提案与辩论-获取R1多个智能体的提案==#
-                            ## Frontier frontier这里指的是[A,B,C]的列表
-                            if agent[j].l_step <= 125 or FN_PR[0] >= 0.3:
-                            # if agent[j].l_step >= 125: # debug历史节点，记得该回去
-                                Frontier_Choice_Prompt = form_prompt_for_Frontier_Reason(frontiers[Choice])
-                                robots[j].target_point = frontiers[Choice]
-                                _, Choice_Reason = cogvlm2.COT2(User_Prompt1=Meta_Prompt, 
-                                                                User_Prompt2=Frontier_Choice_Prompt,
-                                                                cot_pred1=Meta_Choice,
-                                                                return_string_probabilities=None, img=sem_map_frontier)
-                                # print(Choice_Reason)
-                                # exit()
-                                # cv2.imwrite(f'Frontier_Choice_Reason_{agent[j].l_step}.png', sem_map_frontier)
-                                MCoCo_Decision_COT['Meta_Prompt'] = Meta_Prompt
-                                MCoCo_Decision_COT['Frontier_Choice_Prompt'] = Frontier_Choice_Prompt
-                                MCoCo_Decision_COT['Meta_Choice'] = Meta_Choice
-                                MCoCo_Decision_COT['Choice_Reason'] = Choice_Reason
-                                MCoCo_Decision_COT['sem_map_frontier'] = sem_map_frontier
-                                
-                            ## History
-                            else:
-                                historys = [chr(i) for i in range(ord('a'), ord('z') + 1)]
-                                History_Choice_Prompt = form_prompt_for_History_Reason()
-                                # robots[j].target_point = history[Choice]
-                                _, Choice_Reason = cogvlm2.simple_image_chat(User_Prompt=History_Choice_Prompt,
-                                                            return_string_probabilities=None, img=sem_map)
-                                MCoCo_Decision_COT['History_Choice_Prompt'] = History_Choice_Prompt
-                                MCoCo_Decision_COT['Choice_Reason'] = Choice_Reason
-                                MCoCo_Decision_COT['sem_map'] = sem_map
-                            # print("hfovs:",h_score)
-                            # print(frontiers[Choice])
-                            # print(Choice_Reason)
 
                             
-                        # 其中一个机器人不存在frontier
-                        # len(agent_TargetPointMap[j]) == 0
-                        else:
-                            No_Frontier_Group = True
-                            logging.info(f'===== Agent_{j} No Frontier, Random Mode =====')
-                            Choice_Reason = "No Frontier, choose random long-term target points."
-                            robots[j].target_point = None
-                            robots[j].JS = 0.0 # 这个点需要注意一下，没有frontier，强制设定为非frontier
-                            #### 修改为历史node
-                            # actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
-                            # goal_points[j] = [int(actions[0]), int(actions[1])]
                             
-                            # Frontiers_dict = {}
-                            # for k in range(len(agent_TargetPointMap[j])):
-                            #     Frontiers_dict['frontier_' + str(k)] = f"<centroid: {agent_TargetPointMap[j][k][0], agent_TargetPointMap[j][k][1]}, number: {agent_FrontierList[j][k]}>"
-                            # Agent States
+                        else:
+                            logging.info(f'===== Agent_{j} No Frontier, Random Mode =====')
+                            #### Modify to history node
                             agent[j].is_Frontier = False
                             c_angle = int(start_o % 360)
                             angle_score = Perception_PR[0] * 2
@@ -1311,108 +1298,31 @@ def main():
                                 goal_points[j] = [int(actions[0]), int(actions[1])]
                             else:
                                 if  j == 0:
-                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3'] #还原
+                                    frontier_keys = ['frontier_0', 'frontier_1', 'frontier_2', 'frontier_3']
                                 logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
                                 actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
                                 goal_points[j] = [int(actions[0]), int(actions[1])]
-                        
-                        MCoCo_Decision_COTs.append(MCoCo_Decision_COT)
-                        agent_choice_reasons.append(Choice_Reason)
                             
-                    # 构建所有智能体的JSON提案（如果存在frontier）
-                    # for k in range(num_agents):
-                    #     R2Prompt = robots[k].propose(agent_choice_reasons[k])
+                            
+                    
+                    # all_objs.append(agent_objs) 
+                    # all_VLM_Pred.append(agents_VLM_Pred)
+                    # all_VLM_PR.append(agents_VLM_PR)
 
-                    # exit()
-
-                    for j in range(num_agents):
-                        robots[j].frontier_coords = frontier_coords
-
-##################################################### 开始执行组间讨论 ######################################################################
-                    # logging.info(f"agent[0].l_step+1:{agent[0].l_step+1}")
-                    # logging.info(f"No_Frontier_Group:{No_Frontier_Group}")
-                    if agent[0].l_step> 45 and ((agent[0].l_step+1) % 25 == 0 and No_Frontier_Group == False):
-                        # logging.info(f"===== Commencement of the Discussion =====")
-                        # coordinator.run_discussion(agent_choice_reasons,)
-                        
-                        # # 对比实验，重复两次，我们随机选择2个智能体作为反驳者（互相认为对方不合理）
-                        # # for i in range(2):
-                        # coordinator.run_r2_discussion(MCoCo_Decision_COTs,)
-                        # Legacy alternative coordination path retained here only as commented reference.
-                        # coordinator.run_r3_discussion()
-                        
-                        # # print("goal_points:",goal_points)
-                        # # 重新决策
-                        
-                        # if len(coordinator.Final_Decision) > 0 and all(target is not None for _, target in coordinator.Final_Decision.items()):
-                        #     Final_Decision = {agent: target_to_frontier[target] for agent, target in coordinator.Final_Decision.items()}
-                        #     logging.info(f"=====> Final_Decision: {Final_Decision}")
-                        #     logging.info(f"=====> Frontier: {frontier_keys}")
-                        #     if all(agent_id in Final_Decision for agent_id in range(1, num_agents + 1)):
-                        #         if all(value in frontier_keys for value in Final_Decision.values()):
-                        #             for agentss in range(num_agents):
-                        #                 key = Final_Decision[agentss+1]
-                        #                 logging.info(f"=====> *** Coordination Result: Agent_{agentss}-{key}")
-                        #                 goal_points[agentss] = [int(x) for x in full_Frontiers_dict[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                        #             # print("new_goal_points:",goal_points)
-                        #             # a =1
-                        # else:
-                        #     logging.info(f"===== No new target required =====")
-                        
-                        # Direct coordination path
-                        initial_scores = {}
-                        frontier_distances = {}
-                        valid_scores = True
-                        for robot in robots:
-                            if robot.origin_Decision_PR is None:
-                                valid_scores = False
-                                break
-                            if len(robot.origin_Decision_PR) < len(coordinator.available_targets):
-                                valid_scores = False
-                                break
-                            initial_scores[robot.id] = list(robot.origin_Decision_PR)
-                            frontier_distances[robot.id] = calculate_frontier_distance(
-                                robot.frontier_coords[robot.id - 1],
-                                coordinator.available_targets,
-                                cur_goal_points[robot.id - 1]
-                            )
-                        if valid_scores:
-                            coordinator.r3_inputs = calculate_R3_weighted_scores(initial_scores, frontier_distances)
-                            coordinator.run_r3_discussion()
-
-                            if len(coordinator.Final_Decision) > 0 and all(target is not None for _, target in coordinator.Final_Decision.items()):
-                                Final_Decision = {agent: target_to_frontier[target] for agent, target in coordinator.Final_Decision.items()}
-                                logging.info(f"=====> Final_Decision: {Final_Decision}")
-                                logging.info(f"=====> Frontier: {frontier_keys}")
-                                if all(agent_id in Final_Decision for agent_id in range(1, num_agents + 1)):
-                                    if all(value in frontier_keys for value in Final_Decision.values()):
-                                        for agentss in range(num_agents):
-                                            key = Final_Decision[agentss+1]
-                                            logging.info(f"=====> *** Coordination Result: Agent_{agentss}-{key}")
-                                            goal_points[agentss] = [int(x) for x in full_Frontiers_dict[key].split('centroid: ')[1].split(', number: ')[0][1:-1].split(', ')]
-                                        # print("new_goal_points:",goal_points)
-                                        # a =1
-                            else:
-                                logging.info(f"===== No new target required =====")
-                        else:
-                            logging.info(f"===== Skip Discussion: invalid scores for VCG =====")
-                        # a =  0
-##################################################### 组间讨论结束 ##################################################
-                # 如果完全不存在frontier，则不进行组内讨论
                 else:
+                    
                     logging.info(f'===== No Frontier, Random Mode===== ')
                     logging.info(f'=====> Agent_{j} state: Step: {agent[j].l_step}; Angle: {start_o}')
                     
                     for j in range(num_agents):
                         agent[j].is_Frontier = False
-                        # rgb = observations[j]['rgb'].astype(np.uint8)
-                        rgb = cv2.cvtColor(observations[j]['rgb'].astype(np.uint8), cv2.COLOR_RGB2BGR)
+                        rgb = observations[j]['rgb'].astype(np.uint8)
                         
                         # full_rgb1.append(full_rgb)
                         all_rgb.append(rgb)
                         goal_name = agent[j].goal_name
                         if args.yolo == 'yolov9':
-                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # 记录一个时间步内每个智能体的目标检测信息
+                            agent_objs[f"agent_{j}"] = yolo.run(rgb) # Record target detection information for each smart body in a single time step
                         else:
                             yolo_output = yolo(source=rgb,conf=0.2)
                             yolo_mapping = [yolo_output[0].names[int(c)] for c in yolo_output[0].boxes.cls]
@@ -1427,7 +1337,9 @@ def main():
                         
                         cur_goal_points.append(start)
 
-                        #### 感知VLM
+                        # ------------------------------------------------------------------
+                        #### Perception VLM
+                        # ------------------------------------------------------------------
                         Caption_Prompt, VLM_Perception_Prompt = form_prompt_for_PerceptionVLM(goal_name, agent_objs[f'agent_{j}'], args.yolo)
                         _, Scene_Information = cogvlm2.simple_image_chat(User_Prompt=Caption_Prompt, 
                                                                         return_string_probabilities=None, img=rgb)
@@ -1498,18 +1410,20 @@ def main():
                         actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
                         goal_points[j] = [int(actions[0]), int(actions[1])]
 
-                
-
-                # 当前场景值得探索，且智能体并没有到Frontier
-                # for i in range(num_agents):
-                #     if len(pre_g_points) == 0:
-                #         break
-                #     if calculate_distance(cur_goal_points[i], pre_g_points[i]) >= 25 and agent[i].is_Frontier == True:
-                #         # print(calculate_distance(cur_goal_points[i], pre_g_points[i]))
-                #         goal_points[i] = pre_g_points[i]
+                        
+                # ------------------------------------------------------------------
+                #### Logical Analysis
+                # ------------------------------------------------------------------
+                # The current scene is worth exploring and the intelligences are not in Frontier
+                for i in range(num_agents):
+                    if len(pre_g_points) == 0:
+                        break
+                    if calculate_distance(cur_goal_points[i], pre_g_points[i]) >= 25 and agent[i].is_Frontier == True:
+                        # print(calculate_distance(cur_goal_points[i], pre_g_points[i]))
+                        goal_points[i] = pre_g_points[i]
 
                 # Local_Policy = 1
-                # 判断距离，如果两次间隔距离过短就选择随机点进行导航
+                # Determine the distance, if the distance between two intervals is too short choose a random point for navigation
                 for i in range(num_agents):
                     if len(pre_goal_points) > 0 and calculate_distance(pre_goal_points[i], cur_goal_points[i]) <= 2.5:
                         actions = np.random.rand(1, 2).squeeze()*(full_target_edge_map.shape[0] - 1)
@@ -1525,7 +1439,6 @@ def main():
             
 
             for i in range(num_agents):
-                # 如果有智能体找到终点，直接导航过去
                 if len(target_point) > 0:
                     for j in range(num_agents):
                         goal_points[j] = target_point
@@ -1550,8 +1463,6 @@ def main():
             #     exit(0)
             # ------------------------------------------------------------------
 
-                # Debug: 不画图
-            
             if args.visualize or args.print_images: 
                 if num_agents == 2:
                     vis_ep_dir = '{}/episodes/eps_{}/Agent0_vis'.format(
@@ -1566,8 +1477,8 @@ def main():
                     # height, _ = sem_map.shape[:2]
                     # legend_resized = cv2.resize(Legend, (Legend.shape[1], height))
                     # img_show = np.hstack((sem_map, legend_resized))
-                    img_show = cv2.cvtColor(observations[0]['rgb'].astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    img_show2 = cv2.cvtColor(observations[1]['rgb'].astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    img_show = observations[0]['rgb'].astype(np.uint8)
+                    img_show2 = observations[1]['rgb'].astype(np.uint8)
                     fn = '{}/episodes/eps_{}/Agent0_vis/VisStep-{}.png'.format(
                         dump_dir, agent[0].episode_n,
                         agent[0].l_step)
@@ -1588,7 +1499,7 @@ def main():
 
             # logging.info(f"full_map_pred.shape: {full_map_pred.shape}") # [20,480,480] HM-3D
 
-##############################################===Metric===##############################################
+##############################################===Metrics===##############################################
 
         count_episodes += 1
         # obj_SR['num_'+agent[0].goal_name] += 1
@@ -1606,7 +1517,7 @@ def main():
             "FPS {},".format(int(count_step / (log_end - log_start)))
         ]) + '\n'
 
-        # 如果出现未知标签，设置成功率为0
+        # Set SR to 0 if unknown tags are present
         if agent[0].goal_id + 4 > 24:
             log += '==========Unknown Label=========='
             log += '\n'
@@ -1733,9 +1644,9 @@ def main():
             log += "multi_SoftSPL: {:.3f} ".format(agg_metrics['SoftSPL'] / count_episodes)
             log += " ---({:.0f}/{:.0f})".format(count_episodes, num_episodes)
         # log += "Total usage: " + str(sum(total_usage)) + ", average usage: " + str(np.mean(total_usage))
-        print(log)
+        # print(log)
         logging.info(log)
-        fn = '{}/TEST.log'.format(log_dir)
+        fn = '{}/MCoCoNav_history.log'.format(log_dir)
         if count_episodes == 1:
             with open(fn,'w', encoding='utf-8') as f:
                 f.write(log)

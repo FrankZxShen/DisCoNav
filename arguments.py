@@ -1,4 +1,5 @@
 import argparse
+import math
 import torch
 
 
@@ -67,6 +68,24 @@ def get_args():
                         help="agent camera height in metres (default:0.88)")
     parser.add_argument('--hfov', type=float, default=79.0,
                         help="horizontal field of view in degrees (default:79)")
+    parser.add_argument('--tau_es', type=float, default=2.0,
+                        help='weight of ES in directional history evidence')
+    parser.add_argument('--tau_js', type=float, default=1.0,
+                        help='weight of JS in directional history evidence')
+    parser.add_argument('--exploration_beta', type=float, default=0.3,
+                        help='post-warm-up JS threshold for frontier exploration')
+    parser.add_argument('--exploration_warmup_steps', type=int, default=125,
+                        help='last local step forced to frontier exploration')
+    parser.add_argument('--history_heading_half_width', type=int, default=39,
+                        help='half-width of the circular history heading window')
+    parser.add_argument('--consensus_lambda', type=float, default=0.3,
+                        help='weight of post-discussion scores in consensus voting')
+    parser.add_argument('--voting_alpha', type=float, default=0.7,
+                        help='weight of semantic scores versus inverse frontier distance')
+    parser.add_argument('--auction_beta', type=float, default=0.8,
+                        help='common multiplier for all nonempty bundle valuations')
+    parser.add_argument('--auction_reserve_price', type=float, default=0.0,
+                        help='seller value per unassigned frontier in exact VCG welfare')
     parser.add_argument('--turn_angle', type=float, default=30,
                         help="Agent turn angle in degrees")
     parser.add_argument('--init_angle', type=float, default=0,
@@ -226,6 +245,17 @@ def get_args():
 
     # parse arguments
     args = parser.parse_args()
+
+    for name in ('consensus_lambda', 'voting_alpha'):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            parser.error('--{} must lie in [0, 1]'.format(name))
+    if not math.isfinite(args.auction_beta) or args.auction_beta <= 0:
+        parser.error('--auction_beta must be positive and finite')
+    if not math.isfinite(args.auction_reserve_price) or args.auction_reserve_price < 0:
+        parser.error('--auction_reserve_price must be nonnegative and finite')
+    if args.num_local_steps <= 0:
+        parser.error('--num_local_steps must be positive')
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
